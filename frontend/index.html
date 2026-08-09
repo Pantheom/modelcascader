@@ -435,7 +435,8 @@
 const API_BASE = ['localhost', '127.0.0.1'].includes(window.location.hostname)
   ? 'http://127.0.0.1:8765'
   : '/api';
-const API_URL = API_BASE + '/route-and-generate';
+// Call the versioned v1 endpoint (full nested schema)
+const API_URL = API_BASE + '/v1/route-and-generate';
 
 function $ (id) { return document.getElementById(id); }
 
@@ -446,30 +447,107 @@ async function submit() {
   setLoading(true);
   clearResults();
 
-  let data;
+  let data, res;
   try {
-    const res = await fetch(API_URL, {
+    res = await fetch(API_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ prompt }),
     });
     data = await res.json();
-    if (!res.ok && !data.final_tier) {
-      // Pure HTTP error with no routing payload
-      showError(data.error || `HTTP ${res.status}`);
-      return;
-    }
   } catch (err) {
+    setLoading(false);
     showError(
       `Could not reach the backend at ${API_URL}.\n` +
       `Make sure the server is running:\n  python server.py\n\nDetail: ${err.message}`
     );
     return;
-  } finally {
-    setLoading(false);
   }
+  setLoading(false);
 
-  renderResult(data);
+  // ── Normalise response ─────────────────────────────────────────────
+  // Success  (200): { request_id, final_tier, model_used, provider_used,
+  //                   response_text, routing:{…}, timing:{…}, fail_safe_triggered }
+  // Gen-fail (4xx): { request_id, error:{code,message,stage}, routing:{…} }
+  //   The server attaches `routing` on generation errors so we can still
+  //   show the G1/G2 scores and the tier badge even with no response_text.
+  // Hard-fail(4xx): { request_id, error:{…} }  — no routing key
+
+  if (res.ok) {
+    // Full success — flatten nested sub-objects into the flat shape
+    // renderResult() was originally written for.
+    const flat = flattenV1(data);
+    renderResult(flat);
+  } else if (data.routing) {
+    // Generation failed but routing succeeded — show routing info + error
+    const flat = flattenV1Error(data);
+    renderResult(flat);
+  } else {
+    // Hard failure (validation error, internal error) — no routing to show
+    const msg = (data.error && data.error.message) || JSON.stringify(data.error) || `HTTP ${res.status}`;
+    showError(msg);
+  }
+}
+
+/**
+ * Flatten a v1 200 response into the flat shape renderResult() expects.
+ */
+function flattenV1(d) {
+  const r = d.routing || {};
+  const t = d.timing  || {};
+  return {
+    // identity
+    request_id:            d.request_id,
+    // tier + model
+    final_tier:            d.final_tier,
+    tier_label:            d.model_used ? tierLabel(d.final_tier) : '',
+    model_used:            d.model_used,
+    provider_used:         d.provider_used,
+    // routing scores
+    gatekeepers_fired:     r.gatekeepers_fired || [],
+    g1_score:              r.g1_score,
+    g1_threshold:          r.g1_threshold,
+    g2_score:              r.g2_score,
+    g2_threshold:          r.g2_threshold,
+    // timing
+    routing_latency_ms:    t.routing_latency_ms,
+    generation_latency_ms: t.generation_latency_ms,
+    // extras
+    fail_safe_triggered:   d.fail_safe_triggered,
+    response_text:         d.response_text || null,
+    error:                 null,
+  };
+}
+
+/**
+ * Flatten a 4xx response that still carries a `routing` block
+ * (generation failed after routing succeeded).
+ */
+function flattenV1Error(d) {
+  const r = d.routing || {};
+  return {
+    request_id:            d.request_id,
+    final_tier:            r.final_tier,
+    tier_label:            r.tier_label || tierLabel(r.final_tier),
+    model_used:            r.model_used,
+    provider_used:         r.provider_used,
+    gatekeepers_fired:     r.gatekeepers_fired || [],
+    g1_score:              r.g1_score,
+    g1_threshold:          r.g1_threshold,
+    g2_score:              r.g2_score,
+    g2_threshold:          r.g2_threshold,
+    routing_latency_ms:    r.routing_latency_ms,
+    generation_latency_ms: 0,
+    fail_safe_triggered:   r.fail_safe_triggered || false,
+    response_text:         null,
+    // surface the structured error message in the generation error card
+    error:                 (d.error && d.error.message) || 'Generation failed.',
+  };
+}
+
+/** Derive a human-readable tier label when the server doesn't supply one. */
+function tierLabel(tier) {
+  return tier === 'tier_1' ? 'Small' : tier === 'tier_2' ? 'Medium' : tier === 'tier_3' ? 'Large' : '?';
 }
 
 function renderResult(d) {
@@ -485,17 +563,17 @@ function renderResult(d) {
   badge.className = "tier-badge";
   const tierNum = d.final_tier === "tier_1" ? 1 : d.final_tier === "tier_2" ? 2 : 3;
   badge.classList.add("tier" + tierNum);
-  $("tierText").textContent = `Tier ${tierNum} — ${d.tier_label}`;
-  $("modelChip").textContent = d.model_used;
+  $("tierText").textContent = `Tier ${tierNum} — ${d.tier_label || tierLabel(d.final_tier)}`;
+  $("modelChip").textContent = d.model_used || '';
 
   // ── G1 ────────────────────────────────────────────────────────────
-  const g1s = d.g1_score !== null ? d.g1_score.toFixed(4) : "—";
+  const g1s = d.g1_score !== null && d.g1_score !== undefined ? d.g1_score.toFixed(4) : "—";
   $("g1Score").textContent = g1s;
-  $("g1Threshold").textContent = `threshold: ${d.g1_threshold.toFixed(5)}`;
+  $("g1Threshold").textContent = d.g1_threshold !== undefined ? `threshold: ${d.g1_threshold.toFixed(5)}` : '';
 
-  const g1Passed = d.g1_score !== null && d.g1_score >= d.g1_threshold;
+  const g1Passed = d.g1_score !== null && d.g1_score !== undefined && d.g1_score >= d.g1_threshold;
   const g1Chip   = $("g1Decision");
-  if (d.g1_score === null) {
+  if (d.g1_score === null || d.g1_score === undefined) {
     g1Chip.className = "decision-chip chip-skip";
     g1Chip.textContent = "error / fail-safe";
   } else if (g1Passed) {
@@ -507,19 +585,19 @@ function renderResult(d) {
   }
 
   // ── G2 ────────────────────────────────────────────────────────────
-  const g2Fired = d.gatekeepers_fired.includes("gatekeeper_2");
-  const g2s     = d.g2_score !== null ? d.g2_score.toFixed(4) : null;
+  const g2Fired = (d.gatekeepers_fired || []).includes("gatekeeper_2");
+  const g2s     = d.g2_score !== null && d.g2_score !== undefined ? d.g2_score.toFixed(4) : null;
   const g2Cell  = $("g2Score");
   const g2Chip  = $("g2Decision");
   const g2Hint  = $("g2Hint");
-  $("g2Threshold").textContent = g2Fired ? `threshold: ${d.g2_threshold.toFixed(5)}` : "";
+  $("g2Threshold").textContent = g2Fired && d.g2_threshold !== null ? `threshold: ${d.g2_threshold.toFixed(5)}` : "";
 
   if (!g2Fired) {
     g2Cell.textContent = "—";
     g2Chip.className   = "decision-chip chip-skip";
     g2Chip.textContent = "not invoked";
     g2Hint.textContent = "G1 stopped at Tier 1 — G2 was short-circuited";
-  } else if (d.g2_score === null) {
+  } else if (d.g2_score === null || d.g2_score === undefined) {
     g2Cell.textContent = "—";
     g2Chip.className   = "decision-chip chip-skip";
     g2Chip.textContent = "error / fail-safe";
@@ -538,9 +616,12 @@ function renderResult(d) {
   }
 
   // ── Latency ───────────────────────────────────────────────────────
-  $("routingLat").textContent = `${d.routing_latency_ms} ms`;
-  $("genLat").textContent     = `${d.generation_latency_ms} ms`;
-  $("totalLat").textContent   = `${(d.routing_latency_ms + d.generation_latency_ms).toFixed(1)} ms`;
+  const rLat = d.routing_latency_ms;
+  const gLat = d.generation_latency_ms;
+  $("routingLat").textContent = rLat !== undefined ? `${rLat} ms` : '—';
+  $("genLat").textContent     = gLat !== undefined && gLat > 0 ? `${gLat} ms` : '—';
+  $("totalLat").textContent   = (rLat !== undefined && gLat !== undefined)
+    ? `${(rLat + gLat).toFixed(1)} ms` : '—';
 
   // ── Response text / generation error ─────────────────────────────
   if (d.response_text) {

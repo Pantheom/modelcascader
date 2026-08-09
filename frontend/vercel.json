@@ -1,5 +1,5 @@
 {
   "rewrites": [
-    { "source": "/api/:match*", "destination": "http://13.61.177.53:8765/:match*" }
+    { "source": "/api/:match*", "destination": "http://16.170.232.254:8765/:match*" }
   ]
 }

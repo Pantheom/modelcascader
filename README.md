@@ -225,30 +225,7 @@ Every routing decision is appended to `logs/routing_telemetry.jsonl` (configurab
 
 Use these logs to analyse score distributions over real traffic and recalibrate thresholds accordingly.
 
----
 
-## File Structure
-
-```
-modelcascader/
-├── config/
-│   └── cascade_config.yaml     # All routing knobs — thresholds, tiers, telemetry
-├── modelcascader/
-│   ├── __init__.py
-│   ├── config_loader.py        # Pydantic v2 schema + YAML loader
-│   ├── router_pool.py          # RouteLLM Controller init + score extraction
-│   ├── cascade.py              # Two-gate escalation logic (the orchestration core)
-│   ├── telemetry.py            # JSONL rotating log + console logger
-│   └── providers.py            # Provider dispatch (OpenAI, Anthropic, Groq, Google Gemini)
-├── eval/
-│   └── evaluate.py             # Tier distribution report over sample queries
-├── sample_queries.txt          # Example queries spanning all three tiers
-├── README.md
-├── requirements.txt
-└── pyproject.toml
-```
-
----
 
 ## Adding a New Provider
 
@@ -332,3 +309,239 @@ The routing step (G1 + G2 scoring) runs entirely locally with the `bert` router 
 - **Generated response** from the winning tier's model
 - **Specific error messages** if a key is missing or the backend is unreachable
 
+---
+
+## REST API
+
+The server exposes a versioned REST API at `/v1/`. The legacy `/route-and-generate` path remains as a compatibility alias for the test frontend and returns the same response shape.
+
+### `POST /v1/route-and-generate`
+
+Run a prompt through the cascade router and return the generated response with full routing diagnostics.
+
+#### Request
+
+```
+Content-Type: application/json
+
+{
+  "prompt": "<non-empty string>"
+}
+```
+
+- `request_id` is **not accepted** from the client — it is always generated server-side (UUID4) and echoed back in every response.
+- Whitespace-only prompts are rejected with 422 (same as a missing `prompt` field).
+
+#### Success response — `200 OK`
+
+```json
+{
+  "request_id": "a3f1c2d4-e5b6-7890-abcd-ef1234567890",
+  "final_tier": "tier_1",
+  "model_used": "llama-3.3-70b-versatile",
+  "provider_used": "groq",
+  "response_text": "2 + 2 equals 4.",
+  "routing": {
+    "gatekeepers_fired": ["gatekeeper_1"],
+    "g1_score": 0.083,
+    "g1_threshold": 0.42013,
+    "g2_score": null,
+    "g2_threshold": null
+  },
+  "timing": {
+    "routing_latency_ms": 4.2,
+    "generation_latency_ms": 312.7,
+    "total_latency_ms": 316.9
+  },
+  "fail_safe_triggered": false
+}
+```
+
+`g2_score` and `g2_threshold` are `null` when G1 short-circuited to Tier 1 (G2 was never invoked).
+
+#### Error response — all `4xx` / `5xx`
+
+Every error — regardless of status code — returns the same envelope:
+
+```json
+{
+  "request_id": "a3f1c2d4-...",
+  "error": {
+    "code": "MISSING_API_KEY",
+    "message": "Authentication failed for provider 'groq' (model: llama-3.3-70b-versatile). Set GROQ_API_KEY in your environment.",
+    "stage": "generation"
+  }
+}
+```
+
+| `code` | HTTP status | `stage` | Meaning |
+|---|---|---|---|
+| `VALIDATION_ERROR` | 422 | `validation` | Missing or empty `prompt`, or malformed JSON body |
+| `MISSING_API_KEY` | 424 | `generation` | The API key for the routed tier's provider is absent or invalid |
+| `PROVIDER_ERROR` | 502 | `generation` | Provider API returned an error (not auth-related) |
+| `TIMEOUT` | 502 | `routing` | A gatekeeper call timed out (fail-safe fires separately) |
+| `INTERNAL_ERROR` | 500 | `routing` or `generation` | Unexpected exception — check server logs |
+
+---
+
+### `GET /v1/health`
+
+Quick status check — confirms the service is running, which providers have valid keys configured, and what thresholds are currently loaded.
+
+```json
+{
+  "status": "ok",
+  "providers": {
+    "google": true,
+    "groq": false
+  },
+  "thresholds": {
+    "gatekeeper_1": 0.42013,
+    "gatekeeper_2": 0.48456
+  },
+  "tiers": {
+    "tier_1": { "provider": "groq", "model": "llama-3.3-70b-versatile", "label": "Small" },
+    "tier_2": { "provider": "google", "model": "gemini-2.5-flash", "label": "Medium" },
+    "tier_3": { "provider": "google", "model": "gemini-3.5-flash", "label": "Large" }
+  }
+}
+```
+
+`providers` values are **booleans only** — the key values themselves are never returned.
+
+---
+
+### `curl` Examples
+
+**Success case:**
+
+```bash
+curl -s -X POST http://localhost:8765/v1/route-and-generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "What is the capital of France?"}' \
+  | python -m json.tool
+```
+
+**Missing prompt → 422:**
+
+```bash
+curl -s -X POST http://localhost:8765/v1/route-and-generate \
+  -H "Content-Type: application/json" \
+  -d '{}' \
+  | python -m json.tool
+# → {"request_id": "...", "error": {"code": "VALIDATION_ERROR", ...}}
+```
+
+**Whitespace-only prompt → 422:**
+
+```bash
+curl -s -X POST http://localhost:8765/v1/route-and-generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "   "}' \
+  | python -m json.tool
+```
+
+**Health check:**
+
+```bash
+curl -s http://localhost:8765/v1/health | python -m json.tool
+```
+
+**Filter debug log by request_id** (replace with the UUID from a real response):
+
+```bash
+grep "a3f1c2d4" logs/debug.jsonl | python -m json.tool
+```
+
+---
+
+## Debug Logging
+
+Structured JSON debug logs are written to **`logs/debug.jsonl`** (rotating, max 10 MB, 5 backups).
+
+Each line is a self-contained JSON object representing one pipeline event:
+
+```json
+{"ts":"2026-08-06T18:00:00.123456+00:00","request_id":"a3f1c2d4-...","event":"REQUEST_RECEIVED","prompt_len":27}
+{"ts":"2026-08-06T18:00:00.128456+00:00","request_id":"a3f1c2d4-...","event":"G1_RESULT","score":0.083,"threshold":0.42013,"decision":"tier_1","failed":false}
+{"ts":"2026-08-06T18:00:00.129012+00:00","request_id":"a3f1c2d4-...","event":"DISPATCH_STARTED","provider":"groq","model":"llama-3.3-70b-versatile","tier":"tier_1"}
+{"ts":"2026-08-06T18:00:00.441234+00:00","request_id":"a3f1c2d4-...","event":"DISPATCH_RESULT","latency_ms":312.2,"success":true}
+{"ts":"2026-08-06T18:00:00.441890+00:00","request_id":"a3f1c2d4-...","event":"RESPONSE_SENT","total_latency_ms":316.9,"final_tier":"tier_1","http_status":200}
+```
+
+Every line shares the same `request_id`, so a complete per-request trace can be extracted with a single `grep`.
+
+### Events logged per request
+
+| Event | When |
+|---|---|
+| `REQUEST_RECEIVED` | Body parsed, prompt validated |
+| `G1_RESULT` | After G1 returns (or errors) |
+| `G2_RESULT` | After G2 returns (if invoked) |
+| `FAIL_SAFE_TRIGGERED` | If any gatekeeper errored and fail-safe fired |
+| `DISPATCH_STARTED` | Just before provider API call |
+| `DISPATCH_RESULT` | After provider returns (success or error) |
+| `RESPONSE_SENT` | Final 200 assembled and written |
+| `ERROR_SENT` | Any 4xx/5xx sent to the caller |
+
+### `DEBUG_LOG_LEVEL` — controlling verbosity
+
+Set this environment variable before starting the server:
+
+```bash
+# Windows
+set DEBUG_LOG_LEVEL=DEBUG    # include truncated prompt/response previews
+set DEBUG_LOG_LEVEL=INFO     # structural events only (default)
+set DEBUG_LOG_LEVEL=WARNING  # errors and warnings only
+
+# macOS / Linux
+export DEBUG_LOG_LEVEL=DEBUG
+```
+
+### Redaction policy
+
+> **Privacy / security note:** The debug log is designed to be safe to store in shared environments.
+>
+> - At `INFO` level (default): prompt and response text are **omitted entirely** from all log lines.
+> - At `DEBUG` level: a **truncated preview** (first 200 characters) of the prompt and response is included. Full text is never written at any level.
+> - API keys are **never** referenced in any log line at any level.
+>
+> If you need to share debug logs for troubleshooting, `INFO` level is safe to share without scrubbing. `DEBUG`-level logs should be treated as potentially containing user data.
+
+### Telemetry vs debug logs
+
+| | `logs/routing_telemetry.jsonl` | `logs/debug.jsonl` |
+|---|---|---|
+| **Purpose** | Analytics — one compact row per query for threshold tuning | Debugging — full per-request event trace |
+| **Granularity** | One line per request | Several lines per request (one per event) |
+| **Prompt text** | First 80 chars (always) | Omitted at INFO; 200-char preview at DEBUG |
+| **Use case** | Offline score distribution analysis, calibration | Tracing individual request failures |
+
+---
+
+## File Structure
+
+```
+modelcascader/
+├── config/
+│   └── cascade_config.yaml     # All routing knobs — thresholds, tiers, telemetry
+├── modelcascader/
+│   ├── __init__.py
+│   ├── api_schemas.py          # Pydantic v2 REST API schema (request / response / error)
+│   ├── config_loader.py        # Pydantic v2 schema + YAML loader
+│   ├── debug_logger.py         # Structured JSON debug event logger
+│   ├── router_pool.py          # RouteLLM Controller init + score extraction
+│   ├── cascade.py              # Two-gate escalation logic (the orchestration core)
+│   ├── telemetry.py            # JSONL rotating log + console logger (analytics)
+│   └── providers.py            # Provider dispatch (OpenAI, Anthropic, Groq, Google Gemini)
+├── eval/
+│   └── evaluate.py             # Tier distribution report over sample queries
+├── logs/
+│   ├── routing_telemetry.jsonl # Per-query analytics log
+│   └── debug.jsonl             # Per-event debug trace log
+├── sample_queries.txt          # Example queries spanning all three tiers
+├── server.py                   # HTTP server — REST API + test UI
+├── README.md
+├── requirements.txt
+└── pyproject.toml
+```
