@@ -41,7 +41,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Security, status
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field, field_validator
 
 # Ensure project root is on sys.path
@@ -111,6 +112,28 @@ app = FastAPI(
 
 
 # ---------------------------------------------------------------------------
+# API key security
+# ---------------------------------------------------------------------------
+
+_API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def _verify_api_key(key: str = Security(_API_KEY_HEADER)) -> None:
+    """Dependency: reject requests that do not supply the correct API key."""
+    expected = os.environ.get("API_KEY", "")
+    if not expected:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server misconfiguration: API_KEY env var is not set.",
+        )
+    if key != expected:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid or missing API key. Supply it in the X-API-Key header.",
+        )
+
+
+# ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
 
@@ -146,7 +169,7 @@ class RouteResponse(BaseModel):
 _TIER_MAP = {"tier_1": 1, "tier_2": 2, "tier_3": 3}
 
 
-@app.post("/route", response_model=RouteResponse)
+@app.post("/route", response_model=RouteResponse, dependencies=[Depends(_verify_api_key)])
 def route_prompt(body: RouteRequest) -> RouteResponse:
     """
     Run the cascade router on the incoming prompt.
@@ -190,3 +213,4 @@ def route_prompt(body: RouteRequest) -> RouteResponse:
 def health() -> dict[str, str]:
     """Simple liveness probe."""
     return {"status": "ok"}
+
