@@ -544,7 +544,7 @@
   <!-- API base: on localhost hits server.py directly; on Vercel goes via /api rewrite proxy -->
   <script>
     const API_BASE = ['localhost', '127.0.0.1'].includes(window.location.hostname)
-      ? 'http://16.170.232.254:8765' // Direct to AWS backend when testing locally
+      ? 'http://16.16.28.68:8000' // Direct to AWS backend when testing locally
       : '/api';
     // Call the versioned v1 endpoint (full nested schema)
     const API_URL = API_BASE + '/v1/route-and-generate';
