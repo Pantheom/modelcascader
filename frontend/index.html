@@ -427,6 +427,70 @@
       color: var(--muted);
       margin-top: .25rem;
     }
+
+    /* ── Settings card (AWS & API Key) ────────────────────────────────── */
+    .settings-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.1rem 1.4rem;
+      margin-bottom: 1.25rem;
+    }
+
+    .settings-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.25rem;
+    }
+
+    @media (max-width: 650px) {
+      .settings-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .input-with-btn {
+      display: flex;
+      gap: 0.5rem;
+    }
+
+    .input-with-btn input {
+      flex: 1;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      font-size: 13px;
+      padding: 0.5rem 0.75rem;
+      font-family: var(--mono);
+      transition: border-color .15s;
+    }
+
+    .input-with-btn input:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+
+    .btn-sm {
+      padding: 0.45rem 0.85rem;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .conn-status {
+      font-size: 11px;
+      margin-top: 0.35rem;
+      min-height: 16px;
+      font-family: var(--mono);
+    }
+
+    .conn-status.ok {
+      color: var(--t1-text);
+    }
+
+    .conn-status.err {
+      color: var(--err-text);
+    }
   </style>
 </head>
 
@@ -437,6 +501,28 @@
       <h1>⚡ Cascade Router — Test UI</h1>
       <p>Submit a prompt to see the routing decision (G1 + G2 scores) and the actual generated response.</p>
     </header>
+
+    <!-- Settings card (AWS Endpoint & API Key) -->
+    <div class="card settings-card">
+      <div class="settings-grid">
+        <div class="settings-col">
+          <label for="serverUrlInput">AWS Server URL</label>
+          <div class="input-with-btn">
+            <input type="text" id="serverUrlInput" value="http://16.16.28.68:8000" placeholder="http://16.16.28.68:8000" />
+            <button type="button" class="btn-sm" id="testConnBtn" onclick="testConnection()">Test</button>
+          </div>
+          <div class="conn-status" id="connStatus"></div>
+        </div>
+        <div class="settings-col">
+          <label for="apiKeyInput">API Key (X-API-Key)</label>
+          <div class="input-with-btn">
+            <input type="password" id="apiKeyInput" placeholder="Paste your API key here..." />
+            <button type="button" class="btn-sm btn-clear" id="toggleKeyBtn" onclick="toggleKeyVisibility()">Show</button>
+          </div>
+          <div class="hint">Saved in browser localStorage</div>
+        </div>
+      </div>
+    </div>
 
     <!-- Input card -->
     <div class="card">
@@ -541,63 +627,203 @@
 
   </div><!-- /page -->
 
-  <!-- API base: on localhost hits server.py directly; on Vercel goes via /api rewrite proxy -->
+  <!-- API Client Script -->
   <script>
-    const API_BASE = ['localhost', '127.0.0.1'].includes(window.location.hostname)
-      ? 'http://16.16.28.68:8000' // Direct to AWS backend when testing locally
-      : '/api';
-    // Call the versioned v1 endpoint (full nested schema)
-    const API_URL = API_BASE + '/v1/route-and-generate';
-
     function $(id) { return document.getElementById(id); }
+
+    const STORAGE_KEY_API_KEY = "cascader_api_key";
+    const STORAGE_KEY_SERVER_URL = "cascader_server_url";
+
+    // Load saved settings from localStorage on startup
+    window.addEventListener("DOMContentLoaded", () => {
+      const savedUrl = localStorage.getItem(STORAGE_KEY_SERVER_URL);
+      if (savedUrl) $("serverUrlInput").value = savedUrl;
+
+      const savedKey = localStorage.getItem(STORAGE_KEY_API_KEY);
+      if (savedKey) $("apiKeyInput").value = savedKey;
+    });
+
+    function toggleKeyVisibility() {
+      const input = $("apiKeyInput");
+      const btn = $("toggleKeyBtn");
+      if (input.type === "password") {
+        input.type = "text";
+        btn.textContent = "Hide";
+      } else {
+        input.type = "password";
+        btn.textContent = "Show";
+      }
+    }
+
+    async function testConnection() {
+      const serverUrl = ($("serverUrlInput").value.trim() || "http://16.16.28.68:8000").replace(/\/+$/, "");
+      localStorage.setItem(STORAGE_KEY_SERVER_URL, serverUrl);
+      const statusEl = $("connStatus");
+      statusEl.className = "conn-status";
+      statusEl.textContent = "Testing connection...";
+
+      try {
+        const res = await fetch(`${serverUrl}/health`, { method: "GET" });
+        if (res.ok) {
+          const data = await res.json();
+          statusEl.className = "conn-status ok";
+          statusEl.textContent = `✓ Connected to ${serverUrl} (status: ${data.status || "ok"})`;
+        } else {
+          statusEl.className = "conn-status err";
+          statusEl.textContent = `✗ Server responded with HTTP ${res.status}`;
+        }
+      } catch (err) {
+        statusEl.className = "conn-status err";
+        statusEl.textContent = `✗ Failed to connect: ${err.message}. Check Security Group & Uvicorn.`;
+      }
+    }
 
     async function submit() {
       const prompt = $("promptInput").value.trim();
       if (!prompt) { $("promptInput").focus(); return; }
 
+      const serverUrl = ($("serverUrlInput").value.trim() || "http://16.16.28.68:8000").replace(/\/+$/, "");
+      const apiKey = $("apiKeyInput").value.trim();
+
+      if (!apiKey) {
+        $("apiKeyInput").focus();
+        showError("Please enter your API Key in the settings box above.");
+        return;
+      }
+
+      // Save for subsequent requests
+      localStorage.setItem(STORAGE_KEY_SERVER_URL, serverUrl);
+      localStorage.setItem(STORAGE_KEY_API_KEY, apiKey);
+
       setLoading(true);
       clearResults();
 
+      const startTime = performance.now();
       let data, res;
+      const targetUrl = `${serverUrl}/route`;
+
       try {
-        res = await fetch(API_URL, {
+        res = await fetch(targetUrl, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            "X-API-Key": apiKey
+          },
           body: JSON.stringify({ prompt }),
         });
         data = await res.json();
       } catch (err) {
         setLoading(false);
         showError(
-          `Could not reach the backend at ${API_URL}.\n` +
-          `Make sure the server is running:\n  python server.py\n\nDetail: ${err.message}`
+          `Could not reach the backend at ${targetUrl}.\n` +
+          `Make sure:\n` +
+          `1. EC2 Security Group has inbound rule for port 8000 (0.0.0.0/0)\n` +
+          `2. Uvicorn is running: uvicorn api:app --host 0.0.0.0 --port 8000\n\n` +
+          `Detail: ${err.message}`
         );
         return;
       }
+      const elapsedMs = Math.round(performance.now() - startTime);
       setLoading(false);
 
-      // ── Normalise response ─────────────────────────────────────────────
-      // Success  (200): { request_id, final_tier, model_used, provider_used,
-      //                   response_text, routing:{…}, timing:{…}, fail_safe_triggered }
-      // Gen-fail (4xx): { request_id, error:{code,message,stage}, routing:{…} }
-      //   The server attaches `routing` on generation errors so we can still
-      //   show the G1/G2 scores and the tier badge even with no response_text.
-      // Hard-fail(4xx): { request_id, error:{…} }  — no routing key
+      if (res.status === 403) {
+        showError("403 Forbidden: Invalid or missing API key. Please check your API Key.");
+        return;
+      }
 
       if (res.ok) {
-        // Full success — flatten nested sub-objects into the flat shape
-        // renderResult() was originally written for.
-        const flat = flattenV1(data);
-        renderResult(flat);
+        if (data.tier !== undefined && data.score !== undefined) {
+          renderSimpleResult(data, elapsedMs);
+        } else {
+          const flat = flattenV1(data);
+          renderResult(flat);
+        }
       } else if (data.routing) {
-        // Generation failed but routing succeeded — show routing info + error
         const flat = flattenV1Error(data);
         renderResult(flat);
       } else {
-        // Hard failure (validation error, internal error) — no routing to show
-        const msg = (data.error && data.error.message) || JSON.stringify(data.error) || `HTTP ${res.status}`;
+        const msg = (data.detail && typeof data.detail === "string")
+          ? data.detail
+          : (data.error && data.error.message) || JSON.stringify(data.detail || data.error) || `HTTP ${res.status}`;
         showError(msg);
       }
+    }
+
+    function renderSimpleResult(d, elapsedMs) {
+      $("results").classList.add("visible");
+      $("errorBlock").style.display = "none";
+      $("successBlock").style.display = "block";
+      $("failsafeBanner").style.display = "none";
+
+      const tierNum = d.tier;
+      const tierLabels = { 1: "Small", 2: "Medium", 3: "Large" };
+      const label = tierLabels[tierNum] || "";
+
+      // ── Tier badge ────────────────────────────────────────────────────
+      const badge = $("tierBadge");
+      badge.className = "tier-badge tier" + tierNum;
+      $("tierText").textContent = `Tier ${tierNum} — ${label}`;
+      $("modelChip").textContent = d.model || "";
+
+      const scoreFormatted = Number(d.score).toFixed(4);
+
+      // ── Gatekeeper 1 & 2 cells ────────────────────────────────────────
+      const g1Cell = $("g1Score");
+      const g1Chip = $("g1Decision");
+      const g1Threshold = $("g1Threshold");
+
+      const g2Cell = $("g2Score");
+      const g2Chip = $("g2Decision");
+      const g2Threshold = $("g2Threshold");
+      const g2Hint = $("g2Hint");
+
+      if (tierNum === 1) {
+        g1Cell.textContent = scoreFormatted;
+        g1Threshold.textContent = "";
+        g1Chip.className = "decision-chip chip-stop";
+        g1Chip.textContent = `score = ${scoreFormatted} → Tier 1 (stop)`;
+
+        g2Cell.textContent = "—";
+        g2Threshold.textContent = "";
+        g2Chip.className = "decision-chip chip-skip";
+        g2Chip.textContent = "not invoked";
+        g2Hint.textContent = "G1 stopped at Tier 1 — G2 short-circuited";
+      } else if (tierNum === 2) {
+        g1Cell.textContent = "—";
+        g1Threshold.textContent = "";
+        g1Chip.className = "decision-chip chip-pass";
+        g1Chip.textContent = "escalated past G1";
+
+        g2Cell.textContent = scoreFormatted;
+        g2Threshold.textContent = "";
+        g2Chip.className = "decision-chip chip-stop";
+        g2Chip.textContent = `score = ${scoreFormatted} → Tier 2 (stop)`;
+        g2Hint.textContent = "G2 decided Tier 2";
+      } else {
+        g1Cell.textContent = "—";
+        g1Threshold.textContent = "";
+        g1Chip.className = "decision-chip chip-pass";
+        g1Chip.textContent = "escalated past G1";
+
+        g2Cell.textContent = scoreFormatted;
+        g2Threshold.textContent = "";
+        g2Chip.className = "decision-chip chip-pass";
+        g2Chip.textContent = `score = ${scoreFormatted} → Tier 3`;
+        g2Hint.textContent = "G2 escalated to Tier 3";
+      }
+
+      // ── Latency ───────────────────────────────────────────────────────
+      $("routingLat").textContent = `${elapsedMs} ms`;
+      $("genLat").textContent = "— (routing only)";
+      $("totalLat").textContent = `${elapsedMs} ms`;
+
+      // ── Response card ─────────────────────────────────────────────────
+      $("responseCard").style.display = "block";
+      $("responseText").textContent =
+        `Query routed to Tier ${tierNum} (${label}) using ${d.model}.\n` +
+        `Deciding Router Score: ${scoreFormatted}\n\n` +
+        `Prompt: "${d.prompt}"`;
+      $("genErrorCard").style.display = "none";
     }
 
     /**
