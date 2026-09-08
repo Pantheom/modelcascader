@@ -1,4 +1,4 @@
-﻿"""
+"""
 api.py
 Routing-only FastAPI service for the Model Cascader.
 
@@ -45,10 +45,15 @@ from fastapi import Depends, FastAPI, HTTPException, Security, status
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field, field_validator
 
+from dotenv import load_dotenv
+
 # Ensure project root is on sys.path
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+# Load .env file from project root if present
+load_dotenv(ROOT / ".env")
 
 # RouteLLM similarity_weighted router instantiates OpenAI() at import time.
 # Setting a placeholder satisfies the constructor if key is not yet set in env.
